@@ -1,11 +1,13 @@
-from genexpr.basemodel import GeneExpressionModel
 import numpy as np
 from scipy.special import loggamma, hyp2f1, binom
+import warnings
+
+from genexpr.basemodel import GeneExpressionModel
 
 
 
 class TwoStageModel(GeneExpressionModel):
-    """ Base class to build specialized gene expression models. """
+    """ Specialized class to simulate the two-stage gene expression model. """
 
     def __init__(self) -> None:
         super().__init__(n_vars=2, n_reactions=4)
@@ -111,15 +113,16 @@ class TwoStageModel(GeneExpressionModel):
     
 
 
-    def analytical_transient(self, n: np.ndarray, t: float, n0: int, args: tuple, normalize: bool = False) -> np.ndarray:
+    def analytical_transient(self, n: np.ndarray, t: float, p0: np.ndarray, args: tuple, normalize: bool = False) -> np.ndarray:
         """
         Analytical (transient) distribution at time t (notice that in the paper tau = d1*t) of the number of proteins n.
-        The distribution assumes that at time t=0 the number of proteins is n0. This is also called a 'propagator'.
+        The distribution assumes that at time t=0 the distribution of proteins is p0.
+        The final distribution is computed by efficiently calculating the propagator with numpy broadcasting.
 
         Inputs:
-            - n [ndarray, shape=(Nn,)]: array containing protein concentrations (must be non-negative)
+            - n [ndarray, shape=(Nn,)]: array containing desired protein concentrations (must be non-negative)
             - t [float]: time where to evaluate the function
-            - n0 [int]: initial protein concentrations (at time t=0)
+            - p0 [ndarray, shape=(Np0,)]: probabilities of initial protein concentrations (at time t=0)
             - args [tuple, shape=(n_reactions,)]: parameters (mainly reaction rates) used to compute propensities
             - normalize [bool]: normalize probabilities to have sum = 1 over n. Default is False
             
@@ -130,9 +133,9 @@ class TwoStageModel(GeneExpressionModel):
         assert isinstance(n, np.ndarray),\
             f"x must be an ndarray, but instead is {str(type(n))}"
         assert isinstance(t, float),\
-            f"x must be a float"
-        assert isinstance(n0, int),\
-            f"x must be an int"
+            f"t must be a float"
+        assert isinstance(p0, np.ndarray),\
+            f"p0 must be an np.ndarray"
         assert len(args)==self.n_reactions,\
             f"args must have length {self.n_reactions}, but instead has length {len(args)}"
 
@@ -142,32 +145,34 @@ class TwoStageModel(GeneExpressionModel):
         a, b, _, tau = nu0/d1, nu1/d0, d0/d1, d1*t
 
         # grids
-        max_n = np.max(n).astype(int)
-        P_n_t = np.zeros(max_n+1)
+        # 0 <= xn <= max(n), 0 <= xk < len(p0), 0 <= xr <= min(max(n),len(p0))
+        max_r = np.min([np.max(n),len(p0)]).astype(int)
+        xn, xk, xr = np.meshgrid(np.arange(np.max(n)+1), np.arange(len(p0)), np.arange(max_r+1), sparse=True, indexing="ij")
 
-        # log probability when n0=0, used to compute the propagator
-        grid_n = np.arange(max_n+1)
-        logP_n_0_t = loggamma(a+grid_n) - loggamma(grid_n+1) - loggamma(a) \
-                 + grid_n*np.log(b/(1+b)) + a*np.log((1+b*np.exp(-tau))/(1+b)) \
-                 + np.log(hyp2f1(-grid_n, -a, 1-a-grid_n, (1+b)/(np.exp(tau)+b)))
+        # log probability of the propagator P_{n|k,r}(tau)
+        # many values are nan, but they will be filtered with a dedicated mask
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=RuntimeWarning)
+
+            logP_nkr_t  = np.log(binom(xk, xr)) + loggamma(a+xn-xr) - loggamma(xn-xr+1) - loggamma(a) \
+                        + (xn-xr)*np.log(b/(1+b)) + a*np.log((1+b*np.exp(-tau))/(1+b)) \
+                        + np.log(hyp2f1(-xn+xr, -a, 1-a-xn+xr, (1+b)/(np.exp(tau)+b))) \
+                        + (xk-xr)*np.log(1-np.exp(-tau)) - xr*tau
+
+        # mask for valid values (sum over r is restricted!)
+        logP_mask = (0<=xr) & (xr<=np.minimum(xn,xk))
+
+        # probability of the actual propagator P_{n|k}(tau)
+        P_nk_t = np.sum(np.exp(logP_nkr_t), where=logP_mask, axis=2)
+
+        # apply propagator on the initial concentration vector p0
+        P_n_t = P_nk_t @ p0
         
-
-        #### TO BE IMPROVED WITH MULTI-DIMENSIONAL SLICING!!!
-        for n_ in range(max_n+1):
-            grid_r = np.arange(min(n_, n0)+1)
-
-            # log probability of the propagator for n0 initial proteins for a given r
-            logP_n_r = np.log(binom(n0, grid_r)) + logP_n_0_t[n_ - grid_r] + (n0-grid_r)*np.log(1-np.exp(-tau)) - grid_r*tau
-
-            # propagator at n=n_ given n0 initial proteins
-            P_n_t[n_] = np.sum(np.exp(logP_n_r))
-        
-
         if normalize:
             P_n_t /= np.sum(P_n_t)
 
-        # select only requested concentrations
-        return P_n_t[n.astype(int)].squeeze()
+        # and select only requested concentrations
+        return (P_n_t)[n.astype(int)].squeeze()
     
 
 
