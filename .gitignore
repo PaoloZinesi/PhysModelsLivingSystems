@@ -131,6 +131,7 @@ dmypy.json
 # Data
 *.xls
 *.xlsx
+*.pdf
 *.png
 *.jpg
 *.zip
